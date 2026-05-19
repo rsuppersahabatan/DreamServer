@@ -2,7 +2,7 @@
 
 import json
 import sys
-from pathlib import Path
+from pathlib import PureWindowsPath
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -152,7 +152,10 @@ def test_update_command_windows_uses_bash_path(monkeypatch):
     monkeypatch.setattr(updates_mod.os, "name", "nt")
     monkeypatch.setattr(updates_mod, "_find_usable_bash", lambda: "C:\\Program Files\\Git\\bin\\bash.exe")
 
-    command = updates_mod._update_command(Path("C:/DreamServer/dream-server/scripts/dream-update.sh"), "check")
+    command = updates_mod._update_command(
+        PureWindowsPath("C:/DreamServer/dream-server/scripts/dream-update.sh"),
+        "check",
+    )
 
     assert command == [
         "C:\\Program Files\\Git\\bin\\bash.exe",
