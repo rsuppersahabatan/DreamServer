@@ -304,15 +304,21 @@ result=$(_classify_id "0xFFFF" "Unknown GPU" amd 8192)
 [[ -n "$result" && "$result" != "null" ]] \
   || { echo "[FAIL] unknown GPU crashed"; exit 1; }
 
-echo "[contract] macOS compose resolver installs PyYAML into checked python3"
+echo "[contract] macOS compose resolver installs PyYAML into an isolated selected-Python venv"
 grep -q '_ensure_macos_pyyaml' installers/macos/install-macos.sh \
   || { echo "[FAIL] macOS installer does not use the PyYAML readiness helper"; exit 1; }
 grep -q 'python-cmd.sh' installers/macos/install-macos.sh \
   || { echo "[FAIL] macOS installer does not load the shared Python resolver"; exit 1; }
-grep -q '\$pycmd" -c '\''import yaml'\''' installers/macos/install-macos.sh \
+grep -q '_macos_python_imports_yaml "$pycmd"' installers/macos/install-macos.sh \
   || { echo "[FAIL] macOS installer does not verify PyYAML with the selected Python"; exit 1; }
-grep -q '\$pycmd" -m pip install --user .*pyyaml' installers/macos/install-macos.sh \
-  || { echo "[FAIL] macOS installer must install PyYAML through the selected Python, not a possibly unrelated pip"; exit 1; }
+grep -q '"$pycmd" -m venv "$venv_dir"' installers/macos/install-macos.sh \
+  || { echo "[FAIL] macOS installer must create the PyYAML venv with the selected Python"; exit 1; }
+grep -q '_set_installer_python_cmd "$venv_python"' installers/macos/install-macos.sh \
+  || { echo "[FAIL] macOS installer must route compose resolver to the venv Python"; exit 1; }
+if grep -q 'pip install --user .*pyyaml\|pip install .*--user .*pyyaml' installers/macos/install-macos.sh; then
+  echo "[FAIL] macOS installer must not use pip --user for PyYAML; Homebrew Python rejects it under PEP 668"
+  exit 1
+fi
 grep -q 'export DREAM_PYTHON_CMD' installers/macos/install-macos.sh \
   || { echo "[FAIL] macOS installer does not export the selected Python for resolver scripts"; exit 1; }
 

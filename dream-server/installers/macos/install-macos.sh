@@ -229,6 +229,11 @@ _require_docker_cpu_budget() {
     ai_ok "Docker CPU budget: ${docker_ncpu} (>=${min_cpus} required for ${workload})"
 }
 
+_macos_python_imports_yaml() {
+    local pycmd="${1:-python3}"
+    "$pycmd" -c 'import yaml' >/dev/null 2>&1
+}
+
 _set_installer_python_cmd() {
     local pycmd="$1"
     export DREAM_PYTHON_CMD="$pycmd"
@@ -249,28 +254,26 @@ _ensure_macos_pyyaml() {
     fi
 
     if [[ -z "$pycmd" ]]; then
-        ai_err "python3 not available — required for compose resolver"
+        ai_err "python3 not available -- required for compose resolver"
         exit 1
     fi
 
-    if "$pycmd" -c 'import yaml' >/dev/null 2>&1; then
+    if _macos_python_imports_yaml "$pycmd"; then
         _set_installer_python_cmd "$pycmd"
         ai_ok "PyYAML available for $pycmd"
         return 0
     fi
 
-    ai "Installing PyYAML (required by compose resolver)..."
-    if "$pycmd" -m pip install --user --quiet --no-warn-script-location pyyaml 2>&1 | tee -a "$DS_LOG_FILE" >/dev/null \
-       && "$pycmd" -c 'import yaml' >/dev/null 2>&1; then
-        _set_installer_python_cmd "$pycmd"
-        ai_ok "PyYAML installed (python3 -m pip --user)"
+    if $DRY_RUN; then
+        ai_warn "PyYAML is not importable by $pycmd (dry-run: would create installer Python venv)."
         return 0
     fi
 
-    ai_warn "PyYAML install via --user failed; trying a private Dream Server installer venv."
-    local venv_dir="${INSTALL_DIR}/.installer-venv"
-    local venv_py="${venv_dir}/bin/python"
-    mkdir -p "$INSTALL_DIR"
+    local venv_dir="${INSTALL_DIR}/.venv/installer-python"
+    local venv_python="${venv_dir}/bin/python"
+
+    ai "Installing PyYAML in isolated installer Python runtime..."
+    mkdir -p "$(dirname "$venv_dir")"
     if ! "$pycmd" -m venv "$venv_dir" 2>&1 | tee -a "$DS_LOG_FILE" >/dev/null; then
         ai_err "Failed to create installer Python venv at $venv_dir."
         ai "  Your Python may be missing the venv module."
@@ -279,23 +282,21 @@ _ensure_macos_pyyaml() {
         exit 1
     fi
 
-    if "$venv_py" -m pip install --quiet --no-warn-script-location pyyaml 2>&1 | tee -a "$DS_LOG_FILE" >/dev/null \
-       && "$venv_py" -c 'import yaml' >/dev/null 2>&1; then
-        _set_installer_python_cmd "$venv_py"
-        ai_ok "PyYAML installed in private installer venv"
+    if "$venv_python" -m pip install --quiet --no-warn-script-location pyyaml 2>&1 | tee -a "$DS_LOG_FILE" >/dev/null \
+       && _macos_python_imports_yaml "$venv_python"; then
+        _set_installer_python_cmd "$venv_python"
+        ai_ok "PyYAML available in installer venv"
         return 0
     fi
 
-    ai_err "Failed to install PyYAML for the macOS installer."
+    ai_err "Failed to install PyYAML for the macOS compose resolver."
     ai "  Log file: $DS_LOG_FILE"
     ai "  Manual recovery:"
-    ai "    $pycmd -m pip install --user pyyaml"
-    ai "  Or:"
-    ai "    $pycmd -m venv $venv_dir && $venv_py -m pip install pyyaml"
+    ai "    $pycmd -m venv '$venv_dir' && '$venv_python' -m pip install pyyaml"
     exit 1
 }
 
-# ── Resolve install directory ──
+# Resolve install directory
 INSTALL_DIR="${DS_INSTALL_DIR}"
 
 if ! $OPENCLAW_EXPLICIT; then
@@ -463,12 +464,11 @@ if ! $DISK_SUFFICIENT; then
 fi
 ai_ok "Disk space OK"
 
-# PyYAML — required by scripts/resolve-compose-stack.sh for the compose
+# PyYAML -- required by scripts/resolve-compose-stack.sh for the compose
 # security scan (it parses every extension/overlay manifest before letting
-# user composes through). Linux distros generally bundle python3-yaml with
-# the system python; macOS does not. Without PyYAML, every extension install
-# fails at compose resolution with a cryptic "ModuleNotFoundError: No module
-# named 'yaml'" returned through the dashboard-api as state=error.
+# user composes through). Homebrew Python on macOS is externally managed, so
+# `pip --user` can fail under PEP 668. Keep the resolver dependency in a
+# Dream-owned venv and point shared Python helpers at that interpreter.
 _ensure_macos_pyyaml
 
 # Ollama conflict detection
