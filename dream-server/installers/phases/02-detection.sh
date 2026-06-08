@@ -128,10 +128,17 @@ else
 
     if [[ "${CAP_PROFILE_LOADED:-false}" == "true" ]]; then
         case "${CAP_LLM_BACKEND:-}" in
-            amd)   GPU_BACKEND="amd" ;;
-            intel) GPU_BACKEND="intel" ;;
-            cpu)   GPU_BACKEND="cpu" ;;
-            apple) GPU_BACKEND="apple" ;;
+            amd)    GPU_BACKEND="amd" ;;
+            intel)  GPU_BACKEND="intel" ;;
+            cpu)    GPU_BACKEND="cpu" ;;
+            apple)  GPU_BACKEND="apple" ;;
+            jetson)
+                if [[ "${DREAM_ENABLE_EXPERIMENTAL_JETSON:-0}" == "1" ]]; then
+                    GPU_BACKEND="jetson"
+                else
+                    GPU_BACKEND="cpu"
+                fi
+                ;;
             *) GPU_BACKEND="nvidia" ;;
         esac
         [[ -n "${CAP_GPU_MEMORY_TYPE:-}" ]] && GPU_MEMORY_TYPE="${CAP_GPU_MEMORY_TYPE}"
