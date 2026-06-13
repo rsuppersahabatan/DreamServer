@@ -25,6 +25,7 @@ VAR_RE = re.compile(
     r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?:(?P<op>:-|-)(?P<default>[^}]+))?\}"
     r"|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)"
 )
+EPHEMERAL_SHA_TAG_RE = re.compile(r"^sha-[0-9a-f]{7,40}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,11 @@ def _is_variable_ref(value: str) -> bool:
     return "$" in value
 
 
+def _is_ephemeral_sha_tag(value: str) -> bool:
+    tag = _image_tag(value)
+    return tag is not None and EPHEMERAL_SHA_TAG_RE.match(tag) is not None
+
+
 def _arg_default_present(path: Path, arg: str, default: str) -> bool:
     expected = f"ARG {arg}={default}"
     return expected in path.read_text(encoding="utf-8")
@@ -280,6 +286,12 @@ def validate_refs(refs: Iterable[ImageRef], lock: dict[str, object], root: Path 
         if _image_tag(ref.value) == "latest" and not _has_digest(ref.value):
             if (ref.path, ref.value) not in latest_allow:
                 errors.append(f"{location}: latest tag requires allow_latest: {ref.value}")
+
+        if _is_ephemeral_sha_tag(ref.value) and not _has_digest(ref.value):
+            errors.append(
+                f"{location}: ephemeral sha-* image tags are not release-stable; "
+                f"pin to a retained version tag or @sha256 digest: {ref.value}"
+            )
 
         if (ref.path, ref.value) not in entry_keys and (ref.path, ref.value) not in latest_allow:
             errors.append(f"{location}: image ref is not recorded in dependency-lock.json: {ref.value}")
