@@ -488,6 +488,173 @@ restart_windows_lemonade_with_full_model() {
     return 1
 }
 
+restart_windows_native_llama_server_with_full_model() {
+    is_windows_bash || return 1
+
+    local runtime llm_backend managed runtime_mode location ps_cmd
+    runtime="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
+    llm_backend="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
+    managed="$(read_env_value AMD_INFERENCE_MANAGED | tr '[:upper:]' '[:lower:]')"
+    runtime_mode="$(read_env_value AMD_INFERENCE_RUNTIME_MODE | tr '[:upper:]' '[:lower:]')"
+    location="$(read_env_value AMD_INFERENCE_LOCATION | tr '[:upper:]' '[:lower:]')"
+    [[ "$runtime" == "llama-server" || "$llm_backend" == "llama-server" || "$runtime_mode" == "windows-llama-server-fallback" ]] || return 1
+    [[ "$managed" == "false" || "$location" == "external" ]] && return 1
+
+    ps_cmd="$(windows_ps_command)"
+    [[ -n "$ps_cmd" ]] || {
+        log "WARNING: no PowerShell executable found; cannot restart native Windows llama-server."
+        return 1
+    }
+
+    local pid_file llama_exe model_path rollback_model_path log_path bind_addr ctx_size llama_port
+    pid_file="$INSTALL_DIR/data/llama-server.pid"
+    llama_exe="$INSTALL_DIR/llama-server/llama-server.exe"
+    model_path="$MODELS_DIR/$FULL_GGUF_FILE"
+    rollback_model_path="$MODELS_DIR/$BOOTSTRAP_GGUF_FILE"
+    log_path="$INSTALL_DIR/data/llama-server.log"
+    bind_addr="$(read_env_value BIND_ADDRESS)"
+    [[ -n "$bind_addr" ]] || bind_addr="127.0.0.1"
+    ctx_size="$(read_env_value CTX_SIZE)"
+    [[ -n "$ctx_size" ]] || ctx_size="$(read_env_value MAX_CONTEXT)"
+    [[ -n "$ctx_size" ]] || ctx_size="$FULL_MAX_CONTEXT"
+    llama_port="$(read_env_value AMD_INFERENCE_PORT)"
+    [[ -n "$llama_port" ]] || llama_port="8080"
+
+    [[ -f "$llama_exe" ]] || {
+        log "WARNING: llama-server.exe not found at $llama_exe. Cannot hot-swap native Windows llama-server."
+        return 1
+    }
+    [[ -f "$model_path" ]] || {
+        log "WARNING: full model not found at $model_path. Cannot hot-swap native Windows llama-server."
+        return 1
+    }
+
+    log "Restarting native Windows llama-server with full model..."
+    DREAM_WIN_PID_FILE="$(windows_path "$pid_file")" \
+    DREAM_WIN_LLAMA_EXE="$(windows_path "$llama_exe")" \
+    DREAM_WIN_MODEL_PATH="$(windows_path "$model_path")" \
+    DREAM_WIN_ROLLBACK_MODEL_PATH="$(windows_path "$rollback_model_path")" \
+    DREAM_WIN_LOG_PATH="$(windows_path "$log_path")" \
+    DREAM_WIN_BIND_ADDR="$bind_addr" \
+    DREAM_WIN_LLAMA_PORT="$llama_port" \
+    DREAM_WIN_CTX_SIZE="$ctx_size" \
+    DREAM_WIN_FLASH_ATTN="$(read_env_value LLAMA_ARG_FLASH_ATTN)" \
+    DREAM_WIN_CACHE_TYPE_K="$(read_env_value LLAMA_ARG_CACHE_TYPE_K)" \
+    DREAM_WIN_CACHE_TYPE_V="$(read_env_value LLAMA_ARG_CACHE_TYPE_V)" \
+    DREAM_WIN_N_CPU_MOE="$(read_env_value LLAMA_ARG_N_CPU_MOE)" \
+    DREAM_WIN_PARALLEL="$(read_env_value LLAMA_PARALLEL)" \
+    DREAM_WIN_CHECKPOINT_EVERY_N_TOKENS="$(read_env_value LLAMA_ARG_CHECKPOINT_EVERY_N_TOKENS)" \
+    DREAM_WIN_NO_CACHE_PROMPT="$(read_env_value LLAMA_ARG_NO_CACHE_PROMPT)" \
+    DREAM_WIN_SPEC_TYPE="$(read_env_value LLAMA_ARG_SPEC_TYPE)" \
+    DREAM_WIN_SPEC_DRAFT_N_MAX="$(read_env_value LLAMA_ARG_SPEC_DRAFT_N_MAX)" \
+    "$ps_cmd" -NoProfile -ExecutionPolicy Bypass -Command '
+        $ErrorActionPreference = "Stop"
+
+        function Stop-DreamProcessId {
+            param([int]$ProcessId)
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt 30; $i++) {
+                $old = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                if (-not $old) { return }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        function Stop-DreamLlamaListeners {
+            param([int]$Port)
+            $deadline = (Get-Date).AddSeconds(20)
+            do {
+                $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+                foreach ($listener in $listeners) {
+                    if ($listener.OwningProcess -gt 0) {
+                        $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f [int]$listener.OwningProcess) -ErrorAction SilentlyContinue
+                        if ($proc -and (
+                            ($proc.Name -like "llama-server*") -or
+                            ($proc.ExecutablePath -and $proc.ExecutablePath.Equals($env:DREAM_WIN_LLAMA_EXE, [StringComparison]::OrdinalIgnoreCase)) -or
+                            ($proc.CommandLine -and $proc.CommandLine.IndexOf("llama-server", [StringComparison]::OrdinalIgnoreCase) -ge 0)
+                        )) {
+                            Stop-DreamProcessId -ProcessId ([int]$listener.OwningProcess)
+                        }
+                    }
+                }
+                if ($listeners.Count -eq 0) { return }
+                Start-Sleep -Milliseconds 500
+            } while ((Get-Date) -lt $deadline)
+        }
+
+        function Start-DreamLlama {
+            param([string]$ModelPath)
+
+            $args = @(
+                "--model", $ModelPath,
+                "--host", $env:DREAM_WIN_BIND_ADDR,
+                "--port", $env:DREAM_WIN_LLAMA_PORT,
+                "--n-gpu-layers", "999",
+                "--ctx-size", $env:DREAM_WIN_CTX_SIZE,
+                "--metrics"
+            )
+            if ($env:DREAM_WIN_FLASH_ATTN) { $args += @("--flash-attn", $env:DREAM_WIN_FLASH_ATTN) }
+            if ($env:DREAM_WIN_CACHE_TYPE_K) { $args += @("--cache-type-k", $env:DREAM_WIN_CACHE_TYPE_K) }
+            if ($env:DREAM_WIN_CACHE_TYPE_V) { $args += @("--cache-type-v", $env:DREAM_WIN_CACHE_TYPE_V) }
+            if ($env:DREAM_WIN_N_CPU_MOE) { $args += @("--n-cpu-moe", $env:DREAM_WIN_N_CPU_MOE) }
+            if ($env:DREAM_WIN_PARALLEL) { $args += @("--parallel", $env:DREAM_WIN_PARALLEL) }
+            if ($env:DREAM_WIN_CHECKPOINT_EVERY_N_TOKENS) { $args += @("--checkpoint-every-n-tokens", $env:DREAM_WIN_CHECKPOINT_EVERY_N_TOKENS) }
+            if ($env:DREAM_WIN_NO_CACHE_PROMPT -and $env:DREAM_WIN_NO_CACHE_PROMPT -notin @("0", "false", "off", "no")) { $args += @("--no-cache-prompt") }
+            if ($env:DREAM_WIN_SPEC_TYPE) { $args += @("--spec-type", $env:DREAM_WIN_SPEC_TYPE) }
+            if ($env:DREAM_WIN_SPEC_DRAFT_N_MAX) { $args += @("--spec-draft-n-max", $env:DREAM_WIN_SPEC_DRAFT_N_MAX) }
+
+            New-Item -ItemType Directory -Path (Split-Path -Parent $env:DREAM_WIN_PID_FILE) -Force | Out-Null
+            New-Item -ItemType Directory -Path (Split-Path -Parent $env:DREAM_WIN_LOG_PATH) -Force | Out-Null
+            $proc = Start-Process -FilePath $env:DREAM_WIN_LLAMA_EXE `
+                -ArgumentList $args -WindowStyle Hidden -RedirectStandardOutput $env:DREAM_WIN_LOG_PATH -RedirectStandardError ($env:DREAM_WIN_LOG_PATH + ".err") -PassThru
+            Set-Content -LiteralPath $env:DREAM_WIN_PID_FILE -Value $proc.Id
+            return $proc
+        }
+
+        function Wait-DreamLlamaHealth {
+            param([int]$ProcessId, [int]$Port)
+            for ($i = 0; $i -lt 60; $i++) {
+                $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                if (-not $proc) { return $false }
+                try {
+                    $resp = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/health" -f $Port) -TimeoutSec 5 -UseBasicParsing
+                    if ([int]$resp.StatusCode -eq 200) { return $true }
+                } catch { }
+                Start-Sleep -Seconds 5
+            }
+            return $false
+        }
+
+        $pidPath = $env:DREAM_WIN_PID_FILE
+        if (Test-Path $pidPath) {
+            $rawPid = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+            if ($rawPid -match "^\d+$") {
+                Stop-DreamProcessId -ProcessId ([int]$rawPid)
+            }
+            Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $port = [int]$env:DREAM_WIN_LLAMA_PORT
+        Stop-DreamLlamaListeners -Port $port
+
+        $fullProc = Start-DreamLlama -ModelPath $env:DREAM_WIN_MODEL_PATH
+        if (Wait-DreamLlamaHealth -ProcessId ([int]$fullProc.Id) -Port $port) { exit 0 }
+
+        Stop-DreamProcessId -ProcessId ([int]$fullProc.Id)
+        if ($env:DREAM_WIN_ROLLBACK_MODEL_PATH -and (Test-Path $env:DREAM_WIN_ROLLBACK_MODEL_PATH)) {
+            $rollbackProc = Start-DreamLlama -ModelPath $env:DREAM_WIN_ROLLBACK_MODEL_PATH
+            [void](Wait-DreamLlamaHealth -ProcessId ([int]$rollbackProc.Id) -Port $port)
+        }
+        exit 1
+    ' >/dev/null 2>&1 || {
+        log "WARNING: native Windows llama-server restart failed."
+        return 1
+    }
+
+    log "SUCCESS: native Windows llama-server running with ${FULL_GGUF_FILE}"
+    return 0
+}
+
 patch_hermes_yaml_with_sed() {
     local path="$1" model="$2" context_length="$3" base_url="${4:-}"
     [[ -f "$path" ]] || return 1
@@ -520,13 +687,13 @@ patch_hermes_yaml_with_sed() {
 }
 
 patch_hermes_model_after_swap() {
-    local gpu_backend llm_backend hermes_base_url old_model new_model tpl
-    gpu_backend="$(read_env_value GPU_BACKEND | tr '[:upper:]' '[:lower:]')"
+    local runtime llm_backend hermes_base_url old_model new_model tpl
+    runtime="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
     llm_backend="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
     hermes_base_url="$(read_env_value HERMES_LLM_BASE_URL)"
     old_model="$BOOTSTRAP_GGUF_FILE"
     new_model="$FULL_GGUF_FILE"
-    if [[ "$gpu_backend" == "amd" || "$llm_backend" == "lemonade" ]]; then
+    if [[ "$runtime" == "lemonade" || "$llm_backend" == "lemonade" ]]; then
         old_model="extra.$BOOTSTRAP_GGUF_FILE"
         new_model="extra.$FULL_GGUF_FILE"
     fi
@@ -846,16 +1013,23 @@ if [[ -n "$FULL_GGUF_SHA256" ]]; then
 fi
 
 _windows_lemonade_swap_applies=false
+_windows_native_llama_swap_applies=false
 if is_windows_bash; then
     _runtime_for_swap="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
     _backend_for_swap="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
+    _managed_for_swap="$(read_env_value AMD_INFERENCE_MANAGED | tr '[:upper:]' '[:lower:]')"
+    _runtime_mode_for_swap="$(read_env_value AMD_INFERENCE_RUNTIME_MODE | tr '[:upper:]' '[:lower:]')"
+    _location_for_swap="$(read_env_value AMD_INFERENCE_LOCATION | tr '[:upper:]' '[:lower:]')"
     if [[ "$_runtime_for_swap" == "lemonade" || "$_backend_for_swap" == "lemonade" ]]; then
         _windows_lemonade_swap_applies=true
+    elif [[ "$_managed_for_swap" != "false" && "$_location_for_swap" != "external" ]] \
+        && [[ "$_runtime_for_swap" == "llama-server" || "$_backend_for_swap" == "llama-server" || "$_runtime_mode_for_swap" == "windows-llama-server-fallback" ]]; then
+        _windows_native_llama_swap_applies=true
     fi
 fi
 
-if [[ "$_windows_lemonade_swap_applies" == "true" ]]; then
-    log "Snapshotting active Windows Lemonade model config before full-model swap..."
+if [[ "$_windows_lemonade_swap_applies" == "true" || "$_windows_native_llama_swap_applies" == "true" ]]; then
+    log "Snapshotting active Windows model config before full-model swap..."
     if ! snapshot_active_model_config; then
         discard_active_model_config_snapshot
         write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
@@ -948,6 +1122,24 @@ if [[ "$_windows_lemonade_swap_applies" == "true" ]]; then
         restore_bootstrap_model_after_windows_swap_failure || log "WARNING: could not restore bootstrap model; inspect $BOOTSTRAP_PATH"
         write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
             "Model downloaded and verified, but native Windows Lemonade did not load it after swap (registration timeout). Previous active model config restored and bootstrap model kept; re-run to retry the swap."
+        exit 1
+    fi
+elif [[ "$_windows_native_llama_swap_applies" == "true" ]]; then
+    if restart_windows_native_llama_server_with_full_model; then
+        if ! patch_hermes_model_after_swap; then
+            log "Restoring previous active model config after Hermes patch failure..."
+            restore_active_model_config || log "WARNING: could not restore active model config; inspect $ENV_FILE and $MODELS_INI"
+            write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+                "Full model downloaded and loaded in native Windows llama-server, but the Hermes config patch failed after swap. Previous active model config restored; re-run to retry."
+            exit 1
+        fi
+        HOT_SWAP_VERIFIED=true
+        discard_active_model_config_snapshot
+    else
+        log "Restoring previous active model config after native Windows llama-server swap timeout..."
+        restore_active_model_config || log "WARNING: could not restore active model config; inspect $ENV_FILE and $MODELS_INI"
+        write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+            "Model downloaded and verified, but native Windows llama-server did not load it after swap. Previous active model config restored and bootstrap model kept; re-run to retry the swap."
         exit 1
     fi
 elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=dream-llama-server --format '{{.Names}}' 2>/dev/null | grep -q dream-llama-server; then
@@ -1591,8 +1783,9 @@ if curl -sf --max-time 3 "${_perplexica_url}/api/config" >/dev/null 2>&1; then
         # On NVIDIA/Apple/CPU, llama.cpp serves under the bare model id —
         # Phase 12 picks the friendly LLM_MODEL string, so do the same.
         _px_model="$FULL_LLM_MODEL"
-        _gpu_backend_for_perplexica=$(grep -E '^GPU_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' || echo "")
-        if [[ "$_gpu_backend_for_perplexica" == "amd" ]]; then
+        _runtime_for_perplexica=$(grep -E '^AMD_INFERENCE_RUNTIME=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' | tr '[:upper:]' '[:lower:]' || echo "")
+        _llm_backend_for_perplexica=$(grep -E '^LLM_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' | tr '[:upper:]' '[:lower:]' || echo "")
+        if [[ "$_runtime_for_perplexica" == "lemonade" || "$_llm_backend_for_perplexica" == "lemonade" ]]; then
             _px_model="extra.$FULL_GGUF_FILE"
         fi
         _litellm_key=$(grep -E '^LITELLM_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' || echo "no-key")
