@@ -54,6 +54,12 @@ def test_fetch_loaded_model_uses_configured_llm_url(monkeypatch):
     assert seen_urls == ["http://host.docker.internal:8080/api/v1/health"]
 
 
+def test_default_model_discovery_timeout_covers_slow_local_runtime():
+    import routers.models as models_router
+
+    assert models_router._MODEL_DISCOVERY_TIMEOUT_SECONDS >= 10.0
+
+
 def test_fetch_loaded_model_falls_back_to_models_when_lemonade_health_empty(monkeypatch):
     import routers.models as models_router
 
