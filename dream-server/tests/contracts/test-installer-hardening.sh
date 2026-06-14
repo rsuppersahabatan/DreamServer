@@ -218,6 +218,12 @@ if "while ($scheduled -and -not (Test-Path -LiteralPath $upgradePidFile)" not in
 print("windows-upgrade-launcher-detached")
 PY
 assert_contains "$tmpdir/windows-upgrade-launcher.out" 'windows-upgrade-launcher-detached' "Windows installer should not wait for the full-model launcher wrapper"
+win_phase04="installers/windows/phases/04-requirements.ps1"
+assert_contains "$win_phase04" 'function Stop-WindowsDreamLemonadePortConflicts' "Windows requirements phase should stop native Lemonade conflicts"
+assert_contains "$win_phase04" 'Native Lemonade is running but this install uses Docker-backed inference' "Windows requirements phase should explain non-AMD Lemonade conflicts"
+assert_contains "$win_phase04" '\$gpuInfo\.Backend -eq "amd" -and -not \$cloudMode' "Windows requirements phase should preserve AMD/Lemonade native runtime"
+assert_contains "$win_phase04" 'Stop-Process -Id \(\[int\]\$_proc\.ProcessId\)' "Windows requirements phase should stop detected Lemonade processes"
+assert_contains "$win_phase04" 'Stop-WindowsDreamLemonadePortConflicts `' "Windows requirements phase should run Lemonade cleanup before port scan"
 assert_contains "installers/windows/dream.ps1" 'Invoke-DreamSttModelDownloadTrigger' "dream.ps1 repair voice should trigger STT preload through a bounded helper"
 assert_not_contains "installers/windows/dream.ps1" 'Invoke-WebRequest -Method POST -Uri \$voice\.SttModelUrl -TimeoutSec 3600' "dream.ps1 repair voice should not block on the long STT preload POST"
 
