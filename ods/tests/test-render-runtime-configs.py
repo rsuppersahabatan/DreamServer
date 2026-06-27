@@ -33,6 +33,13 @@ def file_by_surface(payload: dict[str, object], surface: str) -> dict[str, str]:
     raise AssertionError(f"missing surface {surface}")
 
 
+def model_provider_by_id(settings: dict[str, object], provider_id: str) -> dict[str, object]:
+    for provider in settings["modelProviders"]:
+        if provider["id"] == provider_id:
+            return provider
+    raise AssertionError(f"missing model provider {provider_id}")
+
+
 def test_all_surfaces_render() -> None:
     payload = run_renderer("--surface", "all")
     surfaces = {item["surface"] for item in payload["files"]}
@@ -113,8 +120,9 @@ def test_perplexica_default_model_matches_route() -> None:
         "Research.gguf",
     )
     content = json.loads(file_by_surface(payload, "perplexica")["content"])
+    openai_provider = model_provider_by_id(content, "openai")
     assert content["preferences"]["defaultChatModel"] == "extra.Research.gguf"
-    assert content["modelProviders"]["openai"]["chatModels"][0]["name"] == "extra.Research.gguf"
+    assert openai_provider["chatModels"][0]["name"] == "extra.Research.gguf"
 
 
 def test_write_mode_writes_under_output_root() -> None:
