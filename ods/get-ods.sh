@@ -33,6 +33,15 @@ REPO_URL="${ODS_REPO_URL:-https://github.com/Light-Heart-Labs/ODS.git}"
 INSTALL_DIR="${ODS_INSTALL_DIR:-$ODS_BOOTSTRAP_ROOT/ods}"
 LEGACY_DREAMSERVER_DIR="${DREAMSERVER_INSTALL_DIR:-$ODS_BOOTSTRAP_ROOT/dream-server}"
 ODS_REF="${ODS_REF:-${ODS_BOOTSTRAP_REF:-}}"
+BOOTSTRAP_FORCE=false
+BOOTSTRAP_NON_INTERACTIVE=false
+
+for _arg in "$@"; do
+    case "$_arg" in
+        --force) BOOTSTRAP_FORCE=true ;;
+        --non-interactive) BOOTSTRAP_NON_INTERACTIVE=true ;;
+    esac
+done
 
 log()     { echo -e "${CYAN}[ods]${NC} $1"; }
 success() { echo -e "${GREEN}[  ok ]${NC} $1"; }
@@ -243,13 +252,21 @@ if [[ -d "$INSTALL_DIR" ]]; then
     else
         warn "Directory exists but incomplete install at $INSTALL_DIR"
         echo ""
-        echo -n "  Remove and reinstall? [y/N] "
-        read -r response
-        if [[ "$response" =~ ^[Yy]$ ]]; then
-            rm -rf "$INSTALL_DIR"
-        else
-            echo "  Aborting. Remove manually with: rm -rf $INSTALL_DIR"
+        if [[ "$BOOTSTRAP_FORCE" == "true" ]]; then
+            echo "  Removing incomplete install because --force was provided."
+            rm -rf "$INSTALL_DIR" || error "Failed to remove incomplete install at $INSTALL_DIR"
+        elif [[ "$BOOTSTRAP_NON_INTERACTIVE" == "true" ]]; then
+            echo "  Aborting. Re-run with --force to remove it automatically, or remove manually with: rm -rf $INSTALL_DIR"
             exit 1
+        else
+            echo -n "  Remove and reinstall? [y/N] "
+            read -r response
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                rm -rf "$INSTALL_DIR" || error "Failed to remove incomplete install at $INSTALL_DIR"
+            else
+                echo "  Aborting. Remove manually with: rm -rf $INSTALL_DIR"
+                exit 1
+            fi
         fi
     fi
 fi

@@ -130,6 +130,10 @@ assert_contains "$bootstrap" 'zypper --non-interactive install -y git' "bootstra
 assert_contains "$bootstrap" 'zypper --non-interactive install -y curl' "bootstrap cannot install curl on zypper distros"
 assert_contains "$bootstrap" 'ODS_REF' "bootstrap should allow PR/fleet lanes to clone a matching ref"
 assert_contains "$bootstrap" 'clone_args\+=\(--branch "\$ODS_REF"\)' "bootstrap ref override should apply to git clone"
+assert_contains "$bootstrap" 'BOOTSTRAP_FORCE=false' "bootstrap should parse --force before incomplete install prompts"
+assert_contains "$bootstrap" 'BOOTSTRAP_NON_INTERACTIVE=false' "bootstrap should parse --non-interactive before incomplete install prompts"
+assert_contains "$bootstrap" 'Removing incomplete install because --force was provided' "bootstrap --force should remove incomplete install dirs without prompting"
+assert_contains "$bootstrap" 'Re-run with --force to remove it automatically' "bootstrap --non-interactive should fail with a force hint instead of prompting"
 
 echo "[contract] runtime dispatcher supports non-gnu Linux OSTYPE"
 dispatcher_common="installers/common.sh"
