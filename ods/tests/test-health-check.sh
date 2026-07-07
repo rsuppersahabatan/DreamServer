@@ -171,6 +171,17 @@ exit 7
 CURLSTUB
     chmod +x "$SANDBOX/bin/curl"
 
+    # docker stub: every sandbox container reports as running, so this
+    # scenario exercises the curl success/failure paths. Without the stub,
+    # a host Docker CLI leaks in and reports the fake containers as
+    # not-found, failing the core service before curl is consulted.
+    cat > "$SANDBOX/bin/docker" <<'DOCKERSTUB'
+#!/bin/bash
+echo "running"
+exit 0
+DOCKERSTUB
+    chmod +x "$SANDBOX/bin/docker"
+
     set +e
     agg_json=$(cd "$SANDBOX" && PATH="$SANDBOX/bin:$PATH" INSTALL_DIR="$SANDBOX" \
         bash scripts/health-check.sh --json 2>&1)
