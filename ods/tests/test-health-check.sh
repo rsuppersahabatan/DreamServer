@@ -253,6 +253,78 @@ else
     skip "async aggregation tests (python3 + PyYAML required for service registry)"
 fi
 
+# 8. Disk probe uses POSIX df (-P), not the wrap-prone -h
+if grep -qE 'df -P ' "$ROOT_DIR/scripts/health-check.sh"; then
+    pass "test_disk uses POSIX df -P (avoids long-device-name line wrapping)"
+else
+    fail "test_disk should use df -P for stable single-line output"
+fi
+
+# 9. Behavioral: capacity is parsed correctly even when df wraps the
+# filesystem line (long device name shifts columns). A mock df emits a
+# wrapped 95%-capacity line; the JSON must report disk_usage=95, not the
+# mount point that the old `tail -1 | awk '{print $5}'` parse would pick up.
+MOCK_DIR=$(mktemp -d)
+cat > "$MOCK_DIR/df" <<'MOCK_DF'
+#!/usr/bin/env bash
+# Simulates df output where a long device name wraps onto a second line,
+# shifting the capacity column. Ignores flags/args; capacity is 95%.
+cat <<'DF_OUT'
+Filesystem                              1024-blocks      Used Available Capacity Mounted on
+/dev/mapper/very--long--vg--name-root
+                                          488384000 461000000  27384000      95% /
+DF_OUT
+MOCK_DF
+chmod +x "$MOCK_DIR/df"
+
+set +e
+disk_json=$(cd "$ROOT_DIR" && PATH="$MOCK_DIR:$PATH" bash scripts/health-check.sh --json 2>&1)
+set -e
+rm -rf "$MOCK_DIR"
+
+if echo "$disk_json" | grep -q '"disk_usage": "95"'; then
+    pass "test_disk parses capacity from wrapped df output (column-shift safe)"
+else
+    got=$(echo "$disk_json" | grep -o '"disk_usage": "[^"]*"' | head -1)
+    fail "test_disk mis-parsed wrapped df output; expected disk_usage=95, got: ${got:-<none>}"
+fi
+
+# Helper: run health-check.sh --json with a mock nvidia-smi that reports
+# "mem_used, mem_total, util, temp" and echo the resulting gpu status.
+_gpu_status_with_mock() {
+    local csv="$1" mock_dir gpu_json
+    mock_dir=$(mktemp -d)
+    {
+        echo '#!/usr/bin/env bash'
+        echo "echo '$csv'"
+    } > "$mock_dir/nvidia-smi"
+    chmod +x "$mock_dir/nvidia-smi"
+    set +e
+    gpu_json=$(cd "$ROOT_DIR" && PATH="$mock_dir:$PATH" bash scripts/health-check.sh --json 2>&1)
+    set -e
+    rm -rf "$mock_dir"
+    echo "$gpu_json" | grep -o '"gpu": "[^"]*"' | head -1
+}
+
+# 8. A fully-utilized GPU with low memory must NOT warn. An LLM server pins
+# util at ~100% during normal inference; the old util>95 check flagged that
+# healthy state as "warn". Memory is only 8% here, so status must be "ok".
+gpu_busy=$(_gpu_status_with_mock "2048, 24576, 100, 60")
+if echo "$gpu_busy" | grep -q '"gpu": "ok"'; then
+    pass "test_gpu does not warn on 100% utilization when memory is low"
+else
+    fail "test_gpu warned on healthy high-util GPU; got: ${gpu_busy:-<none>}"
+fi
+
+# 9. High memory pressure (>95%) SHOULD warn — the OOM signal the probe means
+# to surface. 24000/24576 = 97%.
+gpu_full=$(_gpu_status_with_mock "24000, 24576, 30, 60")
+if echo "$gpu_full" | grep -q '"gpu": "warn"'; then
+    pass "test_gpu warns when GPU memory exceeds 95%"
+else
+    fail "test_gpu did not warn on >95% memory; got: ${gpu_full:-<none>}"
+fi
+
 echo ""
 echo "Result: $PASSED passed, $FAILED failed"
 [[ $FAILED -eq 0 ]]
