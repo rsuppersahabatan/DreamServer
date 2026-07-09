@@ -1686,8 +1686,27 @@ Start-Process -FilePath $_pythonLiteral -ArgumentList `$agentArgs -WorkingDirect
 function Update-ComposeFlags {
     <#
     .SYNOPSIS
-        Regenerate .compose-flags by re-scanning enabled extension compose fragments.
-        Mirrors _regenerate_compose_flags() in the Linux ods-cli.
+        Regenerate .compose-flags after an enable/disable operation.
+
+        Strategy (in priority order):
+        1. If scripts/resolve-compose-stack.sh exists and bash is available,
+           delegate entirely to the canonical resolver (preserves backend
+           overlays, multi-GPU overlays, user-extension overlays, and
+           docker-compose.override.yml -- exactly the same stack the installer
+           built). This is the safe path.
+        2. Otherwise fall back to a minimal in-process swap: keep every token
+           in the existing .compose-flags that is NOT an extension service -f
+           entry, then re-scan extensions/services for enabled compose.yaml
+           fragments and append them. This preserves all backend and GPU
+           overlays (--env-file, -f docker-compose.base.yml,
+           -f docker-compose.nvidia.yml, etc.) because those paths never
+           match 'extensions/services' and are kept verbatim.
+
+        The fallback intentionally mirrors only what the Windows installer
+        writes: base + GPU overlay + enabled extension compose.yaml entries.
+        It does NOT add GPU-specific per-extension overlays (compose.nvidia.yaml
+        etc.) because those are the canonical resolver's responsibility and
+        we must not silently diverge from it.
     #>
     $flagsFile = Join-Path $InstallDir ".compose-flags"
     if (-not (Test-Path $flagsFile)) {
@@ -1695,25 +1714,72 @@ function Update-ComposeFlags {
         return
     }
 
-    $existing = (Get-Content $flagsFile -Raw).Trim() -split "\s+"
+    # ── Path 1: delegate to the canonical resolver ────────────────────────────
+    $resolverScript = Join-Path (Join-Path $InstallDir "scripts") "resolve-compose-stack.sh"
+    $bashExe = Get-Command bash -ErrorAction SilentlyContinue
+    if ((Test-Path $resolverScript) -and $bashExe) {
+        # Read GPU_BACKEND and TIER from .env so the resolver uses the same
+        # parameters that the installer originally selected.
+        $gpuBackend = "nvidia"
+        $tier = "1"
+        try {
+            $envMap = Read-ODSEnv
+            if ($envMap.ContainsKey("GPU_BACKEND") -and $envMap["GPU_BACKEND"]) {
+                $gpuBackend = $envMap["GPU_BACKEND"].ToLower()
+            }
+            if ($envMap.ContainsKey("TIER") -and $envMap["TIER"]) {
+                $tier = $envMap["TIER"]
+            }
+        } catch { }
 
-    # Rebuild: keep all non-extension -f flags (env-file, base, GPU overlay, windows AMD, etc.)
-    # then re-scan extensions/services for currently enabled compose fragments.
+        $wslInstallDir = $InstallDir -replace "\\", "/" -replace "^([A-Za-z]):", "/mnt/`$1"
+        $wslInstallDir = $wslInstallDir.ToLower() -replace "^/mnt/([a-z])", { "/mnt/$($_.Groups[1].Value.ToLower())" }
+
+        $resolvedFlagsRaw = & $bashExe.Source "$resolverScript" `
+            --script-dir "$InstallDir" `
+            --gpu-backend "$gpuBackend" `
+            --tier "$tier" `
+            2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($resolvedFlagsRaw)) {
+            # Prepend --env-file .env if the existing flags had it (the resolver
+            # emits only -f flags; the Windows installer adds --env-file separately).
+            $existingRaw = (Get-Content $flagsFile -Raw).Trim()
+            $newContent = $resolvedFlagsRaw.Trim()
+            if ($existingRaw -match '--env-file') {
+                $newContent = "--env-file .env " + $newContent
+            }
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($flagsFile, $newContent, $utf8NoBom)
+            Write-AI "Updated .compose-flags (via resolve-compose-stack.sh)"
+            return
+        }
+        Write-AIWarn "resolve-compose-stack.sh returned non-zero or empty output; falling back to minimal swap."
+    }
+
+    # ── Path 2: minimal in-process swap (fallback) ────────────────────────────
+    # Keep all tokens that are NOT an extension service -f entry, then
+    # re-append only the enabled compose.yaml fragments.
+    # This preserves --env-file, -f docker-compose.base.yml,
+    # -f docker-compose.nvidia.yml, and any other backend overlays verbatim.
+    $existing = (Get-Content $flagsFile -Raw).Trim() -split "\s+"
     $baseFlags = New-Object System.Collections.Generic.List[string]
     $skipNext = $false
     for ($i = 0; $i -lt $existing.Count; $i++) {
         if ($skipNext) { $skipNext = $false; continue }
         if ($existing[$i] -eq "-f" -and ($i + 1) -lt $existing.Count) {
             $nextVal = $existing[$i + 1]
+            # Strip extension service entries (compose.yaml and per-backend
+            # overlays such as compose.nvidia.yaml, compose.local.yaml).
             if ($nextVal -match "extensions[/\\]services[/\\]") {
-                $skipNext = $true
+                $skipNext = $true   # also drop the path token that follows -f
                 continue
             }
         }
         [void]$baseFlags.Add($existing[$i])
     }
 
-    # Re-scan for enabled extension fragments
+    # Re-append only compose.yaml (the base fragment) for enabled extensions.
+    # Per-backend and local-mode overlays require the canonical resolver.
     $extDir = Join-Path (Join-Path $InstallDir "extensions") "services"
     if (Test-Path $extDir) {
         Get-ChildItem -Path $extDir -Directory | Sort-Object Name | ForEach-Object {
@@ -1729,7 +1795,7 @@ function Update-ComposeFlags {
     $newContent = $baseFlags -join " "
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($flagsFile, $newContent, $utf8NoBom)
-    Write-AI "Updated .compose-flags"
+    Write-AI "Updated .compose-flags (fallback minimal swap)"
 }
 
 function Get-ExtensionServiceDir {
@@ -1770,15 +1836,36 @@ function Get-ExtensionCategory {
     return ""
 }
 
+function Test-ODSInstallFiles {
+    <#
+    .SYNOPSIS
+        Validate that the ODS install directory and compose files are present.
+        Does NOT require Docker Desktop to be running -- intentionally lighter
+        than Test-Install so that 'ods enable' works offline.
+    #>
+    if (-not (Test-Path $InstallDir)) {
+        Write-AIError "ODS not found at $InstallDir. Set ODS_HOME or run installer first."
+        exit 1
+    }
+    $baseCompose = Join-Path $InstallDir "docker-compose.base.yml"
+    $monoCompose = Join-Path $InstallDir "docker-compose.yml"
+    if (-not (Test-Path $baseCompose) -and -not (Test-Path $monoCompose)) {
+        Write-AIError "docker-compose.base.yml not found in $InstallDir"
+        exit 1
+    }
+}
+
 function Invoke-Enable {
     <#
     .SYNOPSIS
         Enable an extension service -- mirrors 'ods enable <service>' from the Linux CLI.
         Renames compose.yaml.disabled back to compose.yaml and regenerates .compose-flags.
+        Does NOT require Docker Desktop to be running (file-only operation).
     #>
     param([string]$ServiceId)
 
-    Test-Install
+    # Validate install files only -- Docker is not needed to rename a compose fragment.
+    Test-ODSInstallFiles
 
     if ([string]::IsNullOrWhiteSpace($ServiceId)) {
         Write-AIError "Usage: .\ods.ps1 enable <service>"
@@ -1825,12 +1912,14 @@ function Invoke-Disable {
     <#
     .SYNOPSIS
         Disable an extension service -- mirrors 'ods disable <service>' from the Linux CLI.
-        Stops the running container, renames compose.yaml to compose.yaml.disabled,
-        and regenerates .compose-flags.
+        Stops the running container when Docker is available, then renames
+        compose.yaml to compose.yaml.disabled and regenerates .compose-flags.
+        The file/cache changes always run even when Docker Desktop is offline.
     #>
     param([string]$ServiceId)
 
-    Test-Install
+    # Validate install files only -- Docker stop is best-effort below.
+    Test-ODSInstallFiles
 
     if ([string]::IsNullOrWhiteSpace($ServiceId)) {
         Write-AIError "Usage: .\ods.ps1 disable <service>"
@@ -1864,7 +1953,8 @@ function Invoke-Disable {
         exit 1
     }
 
-    # Stop the container if Docker is running
+    # Best-effort container stop -- skip gracefully when Docker Desktop is
+    # offline so the rename + flags update always succeeds.
     $dockerRunning = $false
     try { $null = docker info 2>$null; $dockerRunning = ($LASTEXITCODE -eq 0) } catch { }
     if ($dockerRunning) {
@@ -1874,8 +1964,11 @@ function Invoke-Disable {
         $ErrorActionPreference = "SilentlyContinue"
         & docker compose @flags stop $ServiceId 2>$null
         $ErrorActionPreference = $prevEAP
+    } else {
+        Write-AIWarn "Docker Desktop is not running -- skipping container stop. $ServiceId will be excluded from the next 'ods start'."
     }
 
+    # Rename and refresh flags regardless of Docker state.
     Rename-Item -LiteralPath $composePath -NewName "compose.yaml.disabled" -Force
     Update-ComposeFlags
     Write-AISuccess "$ServiceId disabled."
